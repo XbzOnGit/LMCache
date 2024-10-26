@@ -232,6 +232,29 @@ class LMCacheEngine:
                 self._chunk_kv(kv_tensors, fmt),
             )
 
+    def _make_empty_chunk_blob_like(self,
+                                    kv_tuple: KVCache,
+                                    token_number: int,
+                                    fmt: str) -> torch.Tensor:
+        num_layer = len(kv_tuple)
+        match fmt:
+            case "vllm":
+                return torch.empty(num_layer, 2,
+                                   token_number,
+                                   kv_tuple[0][0].shape[1],
+                                   kv_tuple[0][0].shape[2],
+                                   dtype=kv_tuple[0][0].dtype,
+                                   device=kv_tuple[0][0].device)
+            case "huggingface":
+                return torch.empty(num_layer, 2,
+                                   kv_tuple[0][0].shape[0],
+                                   token_number,
+                                   kv_tuple[0][0].shape[2],
+                                   dtype=kv_tuple[0][0].dtype,
+                                   device=kv_tuple[0][0].device)
+            case _:
+                raise ValueError(f"Invalid format: {fmt}")
+
     @_lmcache_nvtx_annotate
     @torch.no_grad()
     def store(
@@ -270,6 +293,9 @@ class LMCacheEngine:
         Note:
             The KV cache should NOT have the "batch" dimension.
         """
+        hash_time = 0.0
+        make_chunks_time = 0.0
+        put_time = 0.0
         start_time = time.perf_counter()
         fmt = self.metadata.fmt
         if kv_tensors_mask is None:
@@ -290,27 +316,57 @@ class LMCacheEngine:
             kv_tensors_raw, fmt
         ) + num_skip_tok, \
             "Number of tokens in the kv cache does not match the input tokens"
-        kv_tensors = self._tuple_kv_to_blob(kv_tensors_raw)
-        """ chunk the tokens and the kv caches """
-        chunk_hashes_and_kvs = self._make_chunks(tokens,
-                                                 kv_tensors,
-                                                 fmt,
-                                                 num_skip_chunk,
-                                                 skip_existing=skip_existing)
-        if not blocking:
-            chunk_hashes_and_kvs = list(chunk_hashes_and_kvs)
-        end_make_chunks = time.perf_counter()
-        """ store them into the dictionary """
-        n_chunks = self.engine_.batched_put(
-            ((self._make_key(chunk_hash, fmt), kv_chunk)
-             for chunk_hash, kv_chunk in chunk_hashes_and_kvs),
-            blocking=blocking,
-        )
+        chunk_hashes = self._prefix_hash(self._chunk_tokens(tokens),
+                                         num_skip_chunk)
+        end_hash = time.perf_counter()
+        hash_time += end_hash - start_time
+        start_idx = num_skip_chunk * self.chunk_size
+        start_chunk_idx = num_skip_chunk
+        if skip_existing:
+            for chunk_hash in chunk_hashes:
+                if not self.engine_.contains(self._make_key(chunk_hash, fmt)):
+                    break
+                start_chunk_idx += 1
+                start_idx = min(start_idx + self.chunk_size, len(tokens))
+        n_chunks = 0
+        kv_start_idx = num_skip_chunk * self.chunk_size
+        if start_idx < len(tokens):
+            rela_start_chunk_idx = start_chunk_idx - num_skip_chunk
+            chunk_hashes = chunk_hashes[rela_start_chunk_idx:]
+            assert len(chunk_hashes) > 0, "All chunks are already stored"
+            for chunk_hash in chunk_hashes:
+                rela_idx = start_idx - kv_start_idx
+                end_idx = min(start_idx + self.chunk_size, len(tokens))
+                token_number = end_idx - start_idx
+                assert token_number > 0, "Empty chunk"
+                t1 = time.perf_counter()
+                kv_chunk_buf = self._make_empty_chunk_blob_like(kv_tensors_raw,
+                                                                token_number,
+                                                                fmt)
+                for layer_no, kv_layer in enumerate(kv_tensors_raw):
+                    key_tensor = kv_layer[0]
+                    val_tensor = kv_layer[1]
+                    match fmt:
+                        case "vllm":
+                            kv_chunk_buf[layer_no, 0, :token_number, ...].copy_(key_tensor[rela_idx:rela_idx+token_number, ...])
+                            kv_chunk_buf[layer_no, 1, :token_number, ...].copy_(val_tensor[rela_idx:rela_idx+token_number, ...])
+                        case "huggingface":
+                            kv_chunk_buf[layer_no, 0, :, :token_number, ...].copy_(key_tensor[:, rela_idx:rela_idx+token_number, ...])
+                            kv_chunk_buf[layer_no, 1, :, :token_number, ...].copy_(val_tensor[:, rela_idx:rela_idx+token_number, ...])
+                        case _:
+                            raise ValueError(f"Invalid format: {fmt}")
+                n_chunks += 1
+                t2 = time.perf_counter()
+                make_chunks_time += t2 - t1
+                self.engine_.put(self._make_key(chunk_hash, fmt), kv_chunk_buf, blocking=blocking)
+                t3 = time.perf_counter()
+                put_time += t3 - t2
+                start_idx = end_idx
 
         end_time = time.perf_counter()
         logger.info(f"Stored/updated {n_chunks} chunks, total time "
-                    f"{end_time - start_time:.2f}s, make chunks time "
-                    f"{end_make_chunks - start_time:.2f}s")
+                    f"{end_time - start_time:.2f}s, hash time {hash_time:.2f}, make chunks time "
+                    f"{make_chunks_time:.2f}s, put time {put_time:.2f}s")
 
     # prefix caching only needs a mask_len
     # but non-prefix might need an roi
